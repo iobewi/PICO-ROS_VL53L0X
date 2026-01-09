@@ -1,0 +1,3 @@
+[submodule "components/picoros"]
+	path = components/picoros
+	url = https://github.com/Pico-ROS/picoros-espidf-component
