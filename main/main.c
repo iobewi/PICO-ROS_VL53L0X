@@ -1,7 +1,5 @@
 #include <stdlib.h>
-#include "wifi_connect.h"
 #include "esp_log.h"
-#include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -12,12 +10,6 @@
 
 static const char *TAG = "vl53l0x_picoros";
 
-// -----------------------------------------------------------------------------
-// WiFi Configuration (identique à l’exemple joystick)
-// -----------------------------------------------------------------------------
-#define WIFI_SSID          "yourWIFI SSID"
-#define WIFI_PASS          "password"
-#define WIFI_MAXIMUM_RETRY 5
 
 // -----------------------------------------------------------------------------
 // VL53L0X configuration
@@ -29,10 +21,28 @@ static const char *TAG = "vl53l0x_picoros";
 
 #define PUBLISH_PERIOD_MS      50      // 20 Hz
 
-// -----------------------------------------------------------------------------
-// Pico-ROS objects
-// -----------------------------------------------------------------------------
-static pico_publisher_t publisher;
+// Pico-ROS config
+#define TOPIC_NAME                  "vl53l0x"
+#define MODE                        "client"
+#define ROUTER_ADDRESS              "serial/UART_0#baudrate=115200"
+
+// ROS node
+picoros_node_t node = {
+    .name = "vl53l0x_picoros",
+};
+
+// Publisher
+picoros_publisher_t pub_vl53l0x = {
+    .topic = {
+        .name = TOPIC_NAME,
+        .type = ROSTYPE_NAME(ros_UInt16),
+        .rihs_hash = ROSTYPE_HASH(ros_UInt16),
+    },
+};
+
+// Buffer for publication, used from this thread
+#define PUB_BUF_SIZE 1024
+uint8_t pub_buf[PUB_BUF_SIZE];
 
 // -----------------------------------------------------------------------------
 // VL53L0X driver state
@@ -77,13 +87,15 @@ static void publish_vl53_task(void *pvParameters)
         }
 
         if (valid_sample) {
+            ros_UInt16 vl53 = last_mm ;
             // ---- Serialize UInt16 (std_msgs/UInt16)
-            uint8_t buffer[8];
-            size_t len = 0;
-
-            picoserdes_uint16_serialize(buffer, &len, last_mm);
-
-            pico_publish(&publisher, buffer, len);
+            size_t len = ps_serialize(pub_buf, &vl53, PUB_BUF_SIZE);
+            if (len > 0){
+                picoros_publish(&pub_vl53l0x, pub_buf, len);
+            }
+            else{
+                ESP_LOGE(node.name, "ros_vl53 message serialization error.");
+            }
 
             ESP_LOGI(TAG, "Published: %u mm", last_mm);
         }
@@ -97,18 +109,25 @@ static void publish_vl53_task(void *pvParameters)
 // -----------------------------------------------------------------------------
 void app_main(void)
 {
-    ESP_ERROR_CHECK(nvs_flash_init());
-
-    ESP_LOGI(TAG, "Connecting to WiFi...");
-    wifi_connect_init(WIFI_SSID, WIFI_PASS, WIFI_MAXIMUM_RETRY);
-
     ESP_LOGI(TAG, "Init Pico-ROS");
-    picoros_init();
 
-    publisher = pico_publisher_create(
-        "vl53l0x/mm",
-        "std_msgs/msg/UInt16"
-    );
+    // Init Pico-ROS
+    picoros_interface_t ifx = {
+        .mode = MODE,
+        .locator = ROUTER_ADDRESS,
+    };
+
+    ESP_LOGI(node.name, "Starting pico-ros interface %s %s\n", ifx.mode, ifx.locator );
+    while (picoros_interface_init(&ifx) == PICOROS_NOT_READY){
+        ESP_LOGI(node.name, "Waiting RMW init...\n");
+        z_sleep_s(1);
+    }
+    
+    ESP_LOGI(node.name, "Starting Pico-ROS node %s domain:%lu\n", node.name, node.domain_id);
+    picoros_node_init(&node);
+    
+    ESP_LOGI(node.name, "Declaring publisher on %s\n", pub_vl53l0x.topic.name);
+    picoros_publisher_declare(&node, &pub_vl53l0x);
 
     xTaskCreate(
         publish_vl53_task,
