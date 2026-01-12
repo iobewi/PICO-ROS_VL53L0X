@@ -2,6 +2,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include <math.h>
 
 #include "picoros.h"
 #include "picoserdes.h"
@@ -10,6 +11,15 @@
 
 static const char *TAG = "vl53l0x_picoros";
 
+#define DEG2RAD(x) ((x) * (float)M_PI / 180.0f)
+#define ROS_RANGE_INFRARED 1
+
+static const float VL53_FOV_RAD   = DEG2RAD(25.0f);
+static const float VL53_MIN_M     = 0.005f;
+static const float VL53_MAX_M     = 2.0f;
+
+static const float VL53_SIGMA_BASE_M  = 0.01f;   // Erreur absolue minimale (m)
+static const float VL53_SIGMA_REL      = 0.02f;    /// Erreur relative (% de la distance)
 
 // -----------------------------------------------------------------------------
 // VL53L0X configuration
@@ -24,7 +34,7 @@ static const char *TAG = "vl53l0x_picoros";
 // Pico-ROS config
 #define TOPIC_NAME                  "vl53l0x"
 #define MODE                        "client"
-#define ROUTER_ADDRESS              "serial/UART_0#baudrate=115200"
+#define ROUTER_ADDRESS              "serial/20.21#baudrate=115200"
 
 // ROS node
 picoros_node_t node = {
@@ -35,8 +45,8 @@ picoros_node_t node = {
 picoros_publisher_t pub_vl53l0x = {
     .topic = {
         .name = TOPIC_NAME,
-        .type = ROSTYPE_NAME(ros_UInt16),
-        .rihs_hash = ROSTYPE_HASH(ros_UInt16),
+        .type = ROSTYPE_NAME(ros_Range),
+        .rihs_hash = ROSTYPE_HASH(ros_Range),
     },
 };
 
@@ -87,8 +97,27 @@ static void publish_vl53_task(void *pvParameters)
         }
 
         if (valid_sample) {
-            ros_UInt16 vl53 = last_mm ;
-            // ---- Serialize UInt16 (std_msgs/UInt16)
+
+            z_clock_t clk = z_clock_now();
+            float range_m = ((float)last_mm) / 1000.0f;
+
+            float sigma_m = VL53_SIGMA_BASE_M +
+                            VL53_SIGMA_REL * range_m;
+
+            float variance_m2 = sigma_m * sigma_m;
+
+            ros_Range vl53 = {
+                .header.stamp.nanosec = clk.tv_nsec, 
+                .header.stamp.sec = clk.tv_sec,
+                .header.frame_id = "esp32-vl53",
+                .radiation_type = ROS_RANGE_INFRARED,
+                .field_of_view = VL53_FOV_RAD,
+                .min_range = VL53_MIN_M,
+                .max_range = VL53_MAX_M,
+                .range =  range_m,
+                .variance = variance_m2,
+            };
+
             size_t len = ps_serialize(pub_buf, &vl53, PUB_BUF_SIZE);
             if (len > 0){
                 picoros_publish(&pub_vl53l0x, pub_buf, len);

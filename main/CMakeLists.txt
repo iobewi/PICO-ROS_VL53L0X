@@ -13,3 +13,7 @@ idf_component_register(
 
 idf_build_set_property(COMPILE_OPTIONS -DUSER_TYPE_FILE="include/my_ros_types.h" APPEND)
 idf_build_set_property(COMPILE_OPTIONS -I${CMAKE_CURRENT_SOURCE_DIR} APPEND)
+
+target_compile_definitions(${COMPONENT_LIB} PUBLIC
+    Z_FEATURE_LINK_SERIAL=1
+)

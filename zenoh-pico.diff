@@ -1,0 +1,184 @@
+diff --git a/include/zenoh-pico/config.h b/include/zenoh-pico/config.h
+index 722b5d44..a1f5b2db 100644
+--- a/include/zenoh-pico/config.h
++++ b/include/zenoh-pico/config.h
+@@ -41,7 +41,15 @@
+ #define Z_FEATURE_LINK_TCP 1
+ #define Z_FEATURE_LINK_BLUETOOTH 0
+ #define Z_FEATURE_LINK_WS 0
++
++/*
++ * Allow build-system/application overrides (e.g. -DZ_FEATURE_LINK_SERIAL=1).
++ * Guarding prevents macro redefinition warnings treated as errors (-Werror).
++ */
++#ifndef Z_FEATURE_LINK_SERIAL
+ #define Z_FEATURE_LINK_SERIAL 0
++#endif
++
+ #define Z_FEATURE_LINK_SERIAL_USB 0
+ #define Z_FEATURE_SCOUTING 1
+ #define Z_FEATURE_LINK_UDP_MULTICAST 1
+diff --git a/src/system/espidf/network.c b/src/system/espidf/network.c
+index 85f23222..c0331959 100644
+--- a/src/system/espidf/network.c
++++ b/src/system/espidf/network.c
+@@ -19,6 +19,8 @@
+ #include <string.h>
+ #include <unistd.h>
+ 
++#include "soc/soc_caps.h"
++
+ #include "zenoh-pico/collections/slice.h"
+ #include "zenoh-pico/collections/string.h"
+ #include "zenoh-pico/config.h"
+@@ -714,23 +716,88 @@ size_t _z_send_udp_multicast(const _z_sys_net_socket_t sock, const uint8_t *ptr,
+ 
+ #if Z_FEATURE_LINK_SERIAL == 1
+ /*------------------ Serial sockets ------------------*/
++
++/**
++ * Open a serial link using GPIO-based locator syntax.
++ *
++ * This is selected when the serial locator address contains a dot and is parsed as
++ * "serial/<tx>.<rx>#baudrate=<...>" by _z_f_link_open_serial().
++ *
++ * Example:
++ *   "serial/10.9#baudrate=115200"
++ * will call:
++ *   _z_open_serial_from_pins(sock, txpin=10, rxpin=9, baudrate=115200)
++ *
++ * Note:
++ * - The UART peripheral (UART0/UART1/...) is chosen internally by this ESP-IDF port.
++ * - Pins are provided by the locator and applied via uart_set_pin().
++ */
+ z_result_t _z_open_serial_from_pins(_z_sys_net_socket_t *sock, uint32_t txpin, uint32_t rxpin, uint32_t baudrate) {
+-    z_result_t ret = _Z_RES_OK;
+-    (void)(sock);
+-    (void)(txpin);
+-    (void)(rxpin);
+-    (void)(baudrate);
++    /* Prefer UART1 when available to avoid interfering with the default console on UART0.
++     * On SoCs exposing a single UART controller, fallback to UART0.
++     */
++#if SOC_UART_NUM > 1
++    sock->_serial = UART_NUM_1;
++#else
++    sock->_serial = UART_NUM_0;
++#endif
+ 
+-    // @TODO: To be implemented
+-    _Z_ERROR_LOG(_Z_ERR_GENERIC);
+-    ret = _Z_ERR_GENERIC;
++    /* ESP-IDF expects 'flow_ctrl' to use UART_HW_FLOWCTRL_* values (hardware flow control),
++     * while UART_MODE_UART refers to UART mode selection and is not part of that enum.
++     *
++     * Using UART_HW_FLOWCTRL_DISABLE avoids relying on accidental enum/value compatibility
++     * that may change across ESP-IDF versions or SoCs.
++     *
++     * When available, we also set 'source_clk' explicitly to the default UART clock source
++     * to keep behavior consistent across ESP-IDF versions and targets.
++     */
++    const uart_config_t config = {
++        .baud_rate = (int)baudrate,
++        .parity = UART_PARITY_DISABLE,
++        .stop_bits = UART_STOP_BITS_1,
++        .data_bits = UART_DATA_8_BITS,
++        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
++#if defined(UART_SCLK_DEFAULT)
++        .source_clk = UART_SCLK_DEFAULT,
++#endif
++    };
+ 
+-    return ret;
++    if (uart_param_config(sock->_serial, &config) != 0) {
++        _Z_ERROR_RETURN(_Z_ERR_GENERIC);
++    }
++    if (uart_set_pin(sock->_serial, (int)txpin, (int)rxpin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE) != 0) {
++        _Z_ERROR_RETURN(_Z_ERR_GENERIC);
++    }
++
++    const int uart_buffer_size = (1024 * 2);
++    QueueHandle_t uart_queue = NULL;
++    if (uart_driver_install(sock->_serial, uart_buffer_size, 0, 100, &uart_queue, 0) != 0) {
++        _Z_ERROR_RETURN(_Z_ERR_GENERIC);
++    }
++    uart_flush_input(sock->_serial);
++
++    return _z_connect_serial(*sock);
+ }
+ 
++/**
++ * Open a serial link using a logical UART device name.
++ *
++ * This is selected when the serial locator address does NOT contain a dot and is parsed as
++ * "serial/<device>#baudrate=<...>" by _z_f_link_open_serial().
++ *
++ * Example:
++ *   "serial/UART_0#baudrate=115200"
++ * will call:
++ *   _z_open_serial_from_dev(sock, dev="UART_0", baudrate=115200)
++ *
++ * Note:
++ * - This function additionally assigns a default TX/RX pin mapping for each device name.
++ * - For custom pins, use the pin-based locator form "serial/<tx>.<rx>#baudrate=<...>".
++ */
+ z_result_t _z_open_serial_from_dev(_z_sys_net_socket_t *sock, char *dev, uint32_t baudrate) {
+     uint32_t rxpin = 0;
+     uint32_t txpin = 0;
++
+     if (strcmp(dev, "UART_0") == 0) {
+         sock->_serial = UART_NUM_0;
+         rxpin = 3;
+@@ -739,30 +806,43 @@ z_result_t _z_open_serial_from_dev(_z_sys_net_socket_t *sock, char *dev, uint32_
+         sock->_serial = UART_NUM_1;
+         rxpin = 9;
+         txpin = 10;
++#if SOC_UART_NUM > 2
+     } else if (strcmp(dev, "UART_2") == 0) {
+         sock->_serial = UART_NUM_2;
+         rxpin = 16;
+         txpin = 17;
++#endif
+     } else {
+         _Z_ERROR_RETURN(_Z_ERR_GENERIC);
+     }
+ 
++    /* Same rationale as _z_open_serial_from_pins():
++     * - flow_ctrl must use UART_HW_FLOWCTRL_* values in ESP-IDF.
++     * - source_clk is set explicitly when available for stability across versions/targets.
++     */
+     const uart_config_t config = {
+-        .baud_rate = baudrate,
+-        .parity = UART_PARITY_DISABLE,  // Default in Zenoh Rust
+-        .stop_bits = UART_STOP_BITS_1,  // Default in Zenoh Rust
+-        .data_bits = UART_DATA_8_BITS,  // Default in Zenoh Rust
+-        .flow_ctrl = UART_MODE_UART,    // Default in Zenoh Rust
++        .baud_rate = (int)baudrate,
++        .parity = UART_PARITY_DISABLE,
++        .stop_bits = UART_STOP_BITS_1,
++        .data_bits = UART_DATA_8_BITS,
++        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
++#if defined(UART_SCLK_DEFAULT)
++        .source_clk = UART_SCLK_DEFAULT,
++#endif
+     };
++
+     if (uart_param_config(sock->_serial, &config) != 0) {
+         _Z_ERROR_RETURN(_Z_ERR_GENERIC);
+     }
+-
+-    uart_set_pin(sock->_serial, txpin, rxpin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
++    if (uart_set_pin(sock->_serial, (int)txpin, (int)rxpin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE) != 0) {
++        _Z_ERROR_RETURN(_Z_ERR_GENERIC);
++    }
+ 
+     const int uart_buffer_size = (1024 * 2);
+-    QueueHandle_t uart_queue;
+-    uart_driver_install(sock->_serial, uart_buffer_size, 0, 100, &uart_queue, 0);
++    QueueHandle_t uart_queue = NULL;
++    if (uart_driver_install(sock->_serial, uart_buffer_size, 0, 100, &uart_queue, 0) != 0) {
++        _Z_ERROR_RETURN(_Z_ERR_GENERIC);
++    }
+     uart_flush_input(sock->_serial);
+ 
+     return _z_connect_serial(*sock);
